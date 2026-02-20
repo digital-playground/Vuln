@@ -40,13 +40,9 @@ No external dependencies are required.
 1. **Clone or download** the script (`vuln.py`) to your local machine.
 2. **Make it executable** (optional):
    ```bash
-   chmod +x vuln.py
-```
-
-1. Run the script:
-   ```bash
-   python vuln.py
+   chmod +x vuln.py && python vuln.py
    ```
+  
    On first run, the database file (cve_database.sqlite) will be created automatically. You must then update the database (option 1) before scanning.
 
 ---

@@ -1,935 +1,809 @@
 #!/usr/bin/env python3
 """
-spent huge time building it so please donate on "singhsumit.ragc-1@oksbi"(my UPI id)
-Vulnerability Scanner with NVD + CIRCL CVE Database (single-file)
-Improved matching, service identification, and additional checks:
-- Detailed CVE criticality (EPSS, CVSS, severity)
-- Interesting file discovery on web services
-- Anonymous FTP and directory listing tests
-
-Usage: python3 vuln.py
+vuln_online.py - Vulnerability Scanner v2 (Online CVE Lookup)
+Prints a detailed report to the console with CVEs in a table; optional JSON/HTML output.
 """
 from __future__ import annotations
 import os
 import sys
-import json
-import sqlite3
-import socket
-import subprocess
-import threading
-import time
 import re
+import json
+import time
+import socket
 import ssl
-import urllib.request
-import urllib.error
-import ftplib
-from datetime import datetime, timezone, timedelta
-from urllib.request import urlopen, Request
-from urllib.error import URLError
-from urllib.parse import quote, urlparse
+import subprocess
+import csv
+import traceback
+from datetime import datetime, timezone
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------------------------- Configuration ---------------------------------
-NVD_API_KEY = ""  # Optional: set to your NVD API key
-CIRCL_API_BASE = "https://vulnerability.circl.lu/api"
-DB_FILE = "cve_database.sqlite"
-DONATION_UPI = "singhsumit.ragc-1@oksbi"
-DEBUG = False  # Set to True to see debug SQL and additional logs
+try:
+    import requests
+except ImportError:
+    requests = None
+    print("[!] 'requests' not installed. Install with: pip install requests", file=sys.stderr)
 
-# Common ports to scan
-COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
-                993, 995, 1723, 3306, 3389, 5900, 8080, 8443, 8888]
+try:
+    from packaging.version import Version
+except ImportError:
+    Version = None
 
-THREADS = 50
-TIMEOUT = 2  # socket timeout in seconds
-RATE_LIMIT = 6  # NVD recommended minimum between API calls
+# ----------------- Configuration -----------------
+NVD_API_KEY = os.environ.get("NVD_API_KEY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+THREAD_POOL_SIZE = 80
+SOCKET_TIMEOUT = 3
+RATE_LIMIT = 6
+CIRCL_DELAY = 0.5
 
-# Probes to send to common ports to elicit banners
+COMMON_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
+    993, 995, 1723, 3306, 3389, 5900, 6379, 8080, 8443, 8888
+]
+
 PROBES = {
     21: b"HELP\r\n",
-    22: b"",  # SSH banner usually appears immediately
+    22: b"",
     25: b"EHLO example.com\r\n",
     80: b"HEAD / HTTP/1.0\r\n\r\n",
     110: b"CAPA\r\n",
     143: b"a001 CAPABILITY\r\n",
-    443: b"",  # HTTPS - skip sending probe (would require TLS handshake)
     8080: b"HEAD / HTTP/1.0\r\n\r\n",
-    8443: b"",
     8888: b"HEAD / HTTP/1.0\r\n\r\n",
 }
 
-# Interesting files/directories to check on web servers
 WEB_INTERESTING_PATHS = [
-    "/robots.txt",
-    "/sitemap.xml",
-    "/.git/HEAD",
-    "/.env",
-    "/backup.zip",
-    "/backup.tar.gz",
-    "/phpinfo.php",
-    "/info.php",
-    "/test.php",
-    "/server-status",
-    "/server-info",
-    "/web-console/",
-    "/manager/html",
-    "/phpmyadmin/",
-    "/admin/",
-    "/login",
-    "/wp-admin",
-    "/wp-content",
-    "/README",
-    "/CHANGELOG",
-    "/crossdomain.xml",
-    "/clientaccesspolicy.xml",
-    "/.well-known/security.txt",
+    "/robots.txt", "/sitemap.xml", "/.git/HEAD", "/.env",
+    "/phpinfo.php", "/info.php", "/test.php", "/server-status",
+    "/server-info", "/phpmyadmin/", "/admin/", "/login", "/wp-admin"
 ]
-
-# Directories that may have directory listing enabled
 WEB_LISTING_DIRS = ["/images/", "/css/", "/uploads/", "/backup/", "/logs/"]
 
-# ---------------------------- Database Setup --------------------------------
-def init_database() -> None:
-    """Create database and required tables if they don't exist."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS meta (
-            source TEXT PRIMARY KEY,
-            last_modified TEXT,
-            last_updated TEXT
-        )
-    ''')
-
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS nvd_cves (
-            id TEXT PRIMARY KEY,
-            description TEXT,
-            published TEXT,
-            last_modified TEXT,
-            cvssv2 REAL,
-            cvssv3 REAL,
-            vector TEXT,
-            severity TEXT
-        )
-    ''')
-
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS products (
-            cve_id TEXT,
-            vendor TEXT,
-            product TEXT,
-            version_start TEXT,
-            op_start TEXT,
-            version_end TEXT,
-            op_end TEXT,
-            FOREIGN KEY(cve_id) REFERENCES nvd_cves(id)
-        )
-    ''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_products_vendor_product ON products(vendor, product)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_products_cve ON products(cve_id)')
-
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS circl_enrich (
-            cve_id TEXT PRIMARY KEY,
-            exploit_predictions TEXT,
-            sightings TEXT,
-            external_refs TEXT,
-            last_updated TEXT
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
-
-# ---------------------------- Date Handling ---------------------------------
-def parse_nvd_date(date_str: str | None) -> datetime:
-    """Parse various NVD date formats into a naive datetime object."""
-    if not date_str:
-        return datetime(2015, 1, 1, 0, 0)
-    # Remove trailing timezone strings like " UTC-00:00"
-    if ' UTC' in date_str:
-        date_str = date_str.split(' UTC')[0]
-    formats = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
-    for fmt in formats:
+# ----------------- Utilities -----------------
+def http_get(url: str, timeout: int = 10) -> tuple[int | None, str | None]:
+    """Fallback HTTP GET using urllib (if requests not available)."""
+    try:
+        req = Request(url, headers={"User-Agent": "vuln-scanner-v2/1.0"})
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            try:
+                content = resp.read().decode("utf-8", errors="ignore")
+            except Exception:
+                content = None
+            code = getattr(resp, "status", None) or getattr(resp, "getcode", lambda: None)()
+            return code, content
+    except HTTPError as e:
         try:
-            return datetime.strptime(date_str, fmt)
+            body = e.read().decode("utf-8", errors="ignore")
         except Exception:
-            continue
-    return datetime(2015, 1, 1, 0, 0)
+            body = None
+        return e.code, body
+    except URLError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, str(e)
 
-def format_nvd_api_date(dt: datetime) -> str:
-    """Format datetime for NVD API v2.0: YYYY-MM-DDTHH:MM:SS.000+00:00"""
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000+00:00"
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        sys.stdout.write(" ".join(map(str, args)) + ("\n" if not kwargs.get("end") else ""))
 
-# ---------------------------- CVE Update Functions --------------------------
-def get_latest_cve_date(conn: sqlite3.Connection) -> datetime:
-    c = conn.cursor()
-    c.execute("SELECT MAX(published) FROM nvd_cves")
-    row = c.fetchone()
-    if row and row[0]:
-        return parse_nvd_date(row[0])
-    return datetime(2015, 1, 1, 0, 0)
+# ----------------- Online CVE Fetching -----------------
+# In‑memory caches for a single scan
+_nvd_cache = {}
+_circl_cache = {}
+_kev_set = None
+_exploitdb_set = None
+_metasploit_set = None
 
-def update_from_nvd() -> None:
-    """Fetch CVEs from NVD using v2 REST API in 120-day chunks."""
-    print("[*] Updating from NVD...")
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+def fetch_nvd_cves(product: str, version: str = None) -> list:
+    cache_key = (product, version)
+    if cache_key in _nvd_cache:
+        return _nvd_cache[cache_key]
 
-    latest_cve_date = get_latest_cve_date(conn)
-    start_from = latest_cve_date - timedelta(days=1)
-    if start_from < datetime(2015, 1, 1, 0, 0):
-        start_from = datetime(2015, 1, 1, 0, 0)
-
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    if start_from >= now:
-        print("    Database is already up to date.")
-        conn.close()
-        return
+    if not requests:
+        safe_print("[-] 'requests' required for NVD queries.")
+        return []
 
     base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    keywords = [product]
+    if version:
+        keywords.append(version)
+    query = " ".join(keywords)
+    params = {"keywordSearch": query, "resultsPerPage": 50, "startIndex": 0}
+    headers = {"User-Agent": "vuln-scanner-v2/1.0"}
     if NVD_API_KEY:
-        headers['apiKey'] = NVD_API_KEY
+        headers["apiKey"] = NVD_API_KEY
 
-    total_processed = 0
-    chunk_size = timedelta(days=120)
-    current_start = start_from
-
-    while current_start < now:
-        current_end = min(current_start + chunk_size, now)
-        start_index = 0
-        results_per_page = 2000
-
-        pub_start = quote(format_nvd_api_date(current_start), safe='')
-        pub_end = quote(format_nvd_api_date(current_end), safe='')
-
-        print(f"    Fetching CVEs from {current_start} to {current_end}...")
-
+    all_cves = []
+    try:
         while True:
-            url = f"{base_url}?pubStartDate={pub_start}&pubEndDate={pub_end}&startIndex={start_index}&resultsPerPage={results_per_page}"
-            req = Request(url, headers=headers)
-            try:
-                with urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
-            except URLError as e:
-                print(f"[-] NVD API error: {e}")
+            if not NVD_API_KEY:
+                time.sleep(RATE_LIMIT)
+            resp = requests.get(base_url, params=params, headers=headers, timeout=20)
+            if resp.status_code == 403:
+                safe_print("[-] NVD API rate limit exceeded or access denied.")
                 break
-            except Exception as e:
-                print(f"[-] Unexpected error contacting NVD: {e}")
+            if resp.status_code != 200:
+                safe_print(f"[-] NVD returned status {resp.status_code}")
                 break
-
-            if 'error' in data:
-                print(f"[-] NVD API returned error: {data['error']}")
+            data = resp.json()
+            vulns = data.get("vulnerabilities", [])
+            for item in vulns:
+                cve = item.get("cve", {})
+                cve_id = cve.get("id")
+                if not cve_id:
+                    continue
+                desc = next((d.get("value", "") for d in cve.get("descriptions", []) if d.get("lang") == "en"), "")
+                cvssv3 = None
+                severity = None
+                metrics = cve.get("metrics", {})
+                if "cvssMetricV31" in metrics:
+                    m = metrics["cvssMetricV31"][0]
+                    cvssv3 = m["cvssData"].get("baseScore")
+                    severity = m.get("baseSeverity")
+                elif "cvssMetricV30" in metrics:
+                    m = metrics["cvssMetricV30"][0]
+                    cvssv3 = m["cvssData"].get("baseScore")
+                    severity = m.get("baseSeverity")
+                published = cve.get("published")
+                all_cves.append({
+                    "cve_id": cve_id,
+                    "description": desc[:180] + "..." if len(desc) > 180 else desc,
+                    "cvssv3": cvssv3,
+                    "severity": severity,
+                    "published": published
+                })
+            total = data.get("totalResults", 0)
+            params["startIndex"] += params["resultsPerPage"]
+            if params["startIndex"] >= total or params["startIndex"] >= 200:
                 break
-
-            vulnerabilities = data.get('vulnerabilities', [])
-            if not vulnerabilities:
-                print("    No CVEs in this chunk.")
-                break
-
-            for cve_item in vulnerabilities:
-                insert_nvd_cve_dict(c, cve_item.get('cve', {}))
-                total_processed += 1
-                if total_processed % 100 == 0:
-                    print(f"    Processed {total_processed} CVEs...")
-
-            total_results = data.get('totalResults', 0)
-            start_index += results_per_page
-            print(f"    Retrieved {min(start_index, total_results)}/{total_results} CVEs in this chunk...")
-            if start_index >= total_results:
-                break
-            time.sleep(RATE_LIMIT)
-
-        current_start = current_end
-        time.sleep(RATE_LIMIT)
-
-    c.execute("REPLACE INTO meta (source, last_modified, last_updated) VALUES (?, ?, ?)",
-              ('nvd', now.strftime("%Y-%m-%dT%H:%M:%S"), datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
-    print(f"[+] NVD update completed. Processed {total_processed} CVEs.")
-
-def insert_nvd_cve_dict(c: sqlite3.Cursor, cve_dict: dict) -> None:
-    """Insert a CVE and its configurations into the DB from NVD v2 response structure."""
-    if not cve_dict:
-        return
-    cve_id = cve_dict.get('id')
-    if not cve_id:
-        return
-    descriptions = cve_dict.get('descriptions', [])
-    desc = next((d.get('value', '') for d in descriptions if d.get('lang') == 'en'), "")
-    published = cve_dict.get('published')
-    modified = cve_dict.get('lastModified')
-    metrics = cve_dict.get('metrics', {})
-    cvssv2 = None
-    cvssv3 = None
-    vector = None
-    severity = None
-
-    # CVSS extraction (attempt multiple metric keys)
-    try:
-        if 'cvssMetricV31' in metrics:
-            m = metrics['cvssMetricV31'][0]
-            cvssv3 = m['cvssData'].get('baseScore')
-            vector = m['cvssData'].get('vectorString')
-            severity = m.get('baseSeverity')
-        elif 'cvssMetricV30' in metrics:
-            m = metrics['cvssMetricV30'][0]
-            cvssv3 = m['cvssData'].get('baseScore')
-            vector = m['cvssData'].get('vectorString')
-            severity = m.get('baseSeverity')
-        if 'cvssMetricV2' in metrics:
-            cvssv2 = metrics['cvssMetricV2'][0]['cvssData'].get('baseScore')
-    except Exception:
-        # ignore metric parsing errors
-        pass
-
-    c.execute('''
-        INSERT OR REPLACE INTO nvd_cves
-        (id, description, published, last_modified, cvssv2, cvssv3, vector, severity)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (cve_id, desc, published, modified, cvssv2, cvssv3, vector, severity))
-
-    # Parse configurations -> products table
-    for config in cve_dict.get('configurations', []):
-        for node in config.get('nodes', []):
-            parse_nvd_node(c, node, cve_id)
-
-def parse_nvd_node(c: sqlite3.Cursor, node: dict, cve_id: str) -> None:
-    """Recursively parse configuration nodes and store vendor/product/version constraints."""
-    if 'children' in node:
-        for child in node['children']:
-            parse_nvd_node(c, child, cve_id)
-
-    for match in node.get('cpe_match', []):
-        if not match.get('vulnerable', False):
-            continue
-        cpe23 = match.get('cpe23Uri', '')
-        parts = cpe23.split(':')
-        if len(parts) < 6:
-            continue
-        vendor = parts[3]
-        product = parts[4]
-        version = parts[5]
-        op_start = ''
-        v_start = ''
-        op_end = ''
-        v_end = ''
-
-        if version != '*':
-            op_start = '='
-            v_start = version
-        else:
-            if 'versionStartIncluding' in match:
-                op_start = '>='
-                v_start = match.get('versionStartIncluding', '')
-            elif 'versionStartExcluding' in match:
-                op_start = '>'
-                v_start = match.get('versionStartExcluding', '')
-            if 'versionEndIncluding' in match:
-                op_end = '<='
-                v_end = match.get('versionEndIncluding', '')
-            elif 'versionEndExcluding' in match:
-                op_end = '<'
-                v_end = match.get('versionEndExcluding', '')
-
-        c.execute('''
-            INSERT INTO products
-            (cve_id, vendor, product, version_start, op_start, version_end, op_end)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (cve_id, vendor, product, v_start, op_start, v_end, op_end))
-
-def update_from_circl() -> None:
-    """Fetch enrichment data for recent/un-enriched CVEs from CIRCL."""
-    print("[*] Updating from CIRCL...")
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-    c.execute('''
-        SELECT id FROM nvd_cves
-        WHERE id NOT IN (SELECT cve_id FROM circl_enrich)
-           OR published > ?
-    ''', (thirty_days_ago,))
-    cve_ids = [row[0] for row in c.fetchall()]
-
-    if not cve_ids:
-        print("    No new CVEs to enrich.")
-        conn.close()
-        return
-
-    print(f"    Enriching {len(cve_ids)} CVEs from CIRCL...")
-    enriched = 0
-    for cve_id in cve_ids:
-        try:
-            url = f"{CIRCL_API_BASE}/cve/{cve_id}"
-            req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-            epss = data.get('epss', {}).get('score')
-            sightings = json.dumps(data.get('sightings', []))
-            refs = json.dumps(data.get('references', []))
-            c.execute('''
-                INSERT OR REPLACE INTO circl_enrich
-                (cve_id, exploit_predictions, sightings, external_refs, last_updated)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (cve_id, epss, sightings, refs, datetime.now(timezone.utc).isoformat()))
-            enriched += 1
-            if enriched % 100 == 0:
-                print(f"        Enriched {enriched} CVEs...")
-        except Exception:
-            # CIRCL might not have this CVE, or network issue - skip quietly
-            pass
-        time.sleep(0.5)
-
-    conn.commit()
-    conn.close()
-    print(f"[+] CIRCL enrichment completed for {enriched} CVEs.")
-
-def update_all() -> None:
-    """Initialize DB and update from both NVD and CIRCL."""
-    print("[*] Starting CVE database update...")
-    init_database()
-    update_from_nvd()
-    update_from_circl()
-    print("[+] Database update completed.")
-
-# ---------------------------- CVE Count ------------------------------------
-def show_cve_count() -> None:
-    if not os.path.exists(DB_FILE):
-        print("[*] Database file not found. Count = 0")
-        return
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM nvd_cves")
-        count = c.fetchone()[0]
-        conn.close()
-        print(f"[*] Total CVEs in database: {count}")
     except Exception as e:
-        print(f"[-] Error reading CVE count: {e}")
+        safe_print(f"[-] NVD query error: {e}")
 
-# ---------------------------- Service & OS Detection -----------------------
-def resolve_host(host: str) -> str | None:
-    try:
-        return socket.gethostbyname(host)
-    except socket.gaierror:
-        return None
+    _nvd_cache[cache_key] = all_cves
+    return all_cves
 
-def get_ttl(ip: str) -> int | None:
-    """Ping target and extract TTL value. Returns None on any failure."""
-    param = '-n' if os.name == 'nt' else '-c'
+def fetch_circl_enrichment(cve_id: str) -> dict:
+    if cve_id in _circl_cache:
+        return _circl_cache[cve_id]
+    if not requests:
+        return {"epss": None, "references": []}
+
+    url = f"https://vulnerability.circl.lu/api/cve/{quote(cve_id)}"
+    result = {"epss": None, "references": []}
     try:
-        output = subprocess.check_output(['ping', param, '1', ip],
-                                         stderr=subprocess.STDOUT,
-                                         timeout=5).decode(errors='ignore')
-        match = re.search(r'[Tt][Tt][Ll]=(\d+)', output)
-        if match:
-            return int(match.group(1))
+        time.sleep(CIRCL_DELAY)
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            epss = data.get("epss")
+            if isinstance(epss, dict):
+                epss = epss.get("score")
+            result["epss"] = epss
+            result["references"] = data.get("references", [])
+    except Exception as e:
+        safe_print(f"[-] CIRCL error for {cve_id}: {e}")
+    _circl_cache[cve_id] = result
+    return result
+
+def fetch_kev_set() -> set:
+    global _kev_set
+    if _kev_set is not None:
+        return _kev_set
+    if not requests:
+        _kev_set = set()
+        return _kev_set
+    url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    kev = set()
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("vulnerabilities", []):
+                cve = item.get("cveID")
+                if cve:
+                    kev.add(cve)
+        else:
+            safe_print(f"[-] CISA KEV returned status {resp.status_code}")
+    except Exception as e:
+        safe_print(f"[-] Failed to fetch CISA KEV: {e}")
+    _kev_set = kev
+    return kev
+
+def fetch_exploitdb_set() -> set:
+    global _exploitdb_set
+    if _exploitdb_set is not None:
+        return _exploitdb_set
+    if not requests:
+        _exploitdb_set = set()
+        return _exploitdb_set
+
+    url = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+    exploitdb = set()
+    cve_pattern = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            content = resp.text
+            reader = csv.reader(content.splitlines())
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                for cell in row:
+                    for match in cve_pattern.findall(cell):
+                        exploitdb.add(match.upper())
+            safe_print(f"[*] Exploit-DB: scanned {row_count} rows, found {len(exploitdb)} unique CVEs")
+        else:
+            safe_print(f"[-] Exploit-DB returned status {resp.status_code}")
+    except Exception as e:
+        safe_print(f"[-] Failed to fetch Exploit-DB CSV: {e}")
+    _exploitdb_set = exploitdb
+    return exploitdb
+
+def fetch_metasploit_set() -> set:
+    global _metasploit_set
+    if _metasploit_set is not None:
+        return _metasploit_set
+    if not requests:
+        _metasploit_set = set()
+        return _metasploit_set
+
+    url = "https://raw.githubusercontent.com/rapid7/metasploit-framework/master/db/modules_metadata_base.json"
+    msf = set()
+    cve_pattern = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
+
+    def extract_cves(obj):
+        if isinstance(obj, dict):
+            for v in obj.values():
+                extract_cves(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                extract_cves(item)
+        elif isinstance(obj, str):
+            for match in cve_pattern.findall(obj):
+                msf.add(match.upper())
+
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            extract_cves(data)
+            safe_print(f"[*] Metasploit: scanned JSON, found {len(msf)} unique CVEs")
+        else:
+            safe_print(f"[-] Metasploit metadata returned status {resp.status_code}")
+    except Exception as e:
+        safe_print(f"[-] Failed to fetch Metasploit metadata: {e}")
+    _metasploit_set = msf
+    return msf
+
+def github_search_poc(cve_id: str) -> list[str]:
+    if not GITHUB_TOKEN or not requests:
+        return []
+    try:
+        headers = {"User-Agent": "vuln-scanner-v2", "Authorization": f"token {GITHUB_TOKEN}"}
+        url = f"https://api.github.com/search/code?q={quote(cve_id)}+in:file&per_page=20"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        urls = []
+        for item in data.get("items", [])[:8]:
+            u = item.get("html_url")
+            if u:
+                urls.append(u)
+        return urls
+    except Exception as e:
+        safe_print(f"[-] GitHub search error for {cve_id}: {e}")
+        return []
+
+def compute_exploitability(cve_id: str, cvssv3: float, epss: float,
+                           in_kev: bool, in_exploitdb: bool, in_metasploit: bool) -> tuple[float, list]:
+    score = 0.0
+    evidence = []
+    try:
+        if epss:
+            e = float(epss)
+            if e >= 0.5:
+                score += 0.35
+                evidence.append(f"EPSS={e}")
+            elif e > 0:
+                score += 0.1
+                evidence.append(f"EPSS={e}")
     except Exception:
         pass
-    return None
+    try:
+        if cvssv3:
+            cv = float(cvssv3)
+            score += min(0.3, (cv / 10.0) * 0.3)
+            evidence.append(f"CVSSv3={cv}")
+    except Exception:
+        pass
+    if in_exploitdb:
+        score += 0.25
+        evidence.append("Exploit-DB")
+    if in_metasploit:
+        score += 0.45
+        evidence.append("Metasploit")
+    if in_kev:
+        score += 0.40
+        evidence.append("CISA-KEV")
+    score = min(0.99, score)
+    return score, evidence
 
-def guess_os(ttl: int | None) -> str:
-    if ttl is None:
-        return "Unknown"
-    if ttl <= 64:
-        return "Linux/Unix"
-    if ttl <= 128:
-        return "Windows"
-    if ttl <= 255:
-        return "Solaris/AIX"
-    return "Unknown"
+def find_cves_online(service_name: str, version: str = None,
+                     kev_set: set = None, exploitdb_set: set = None, metasploit_set: set = None) -> list:
+    if not service_name:
+        return []
+    cve_list = fetch_nvd_cves(service_name, version)
+    if not cve_list:
+        return []
 
+    enriched = []
+    for cve in cve_list:
+        cve_id = cve["cve_id"]
+        circl = fetch_circl_enrichment(cve_id)
+        epss = circl.get("epss")
+        in_kev = cve_id in kev_set if kev_set else False
+        in_exploitdb = cve_id in exploitdb_set if exploitdb_set else False
+        in_metasploit = cve_id in metasploit_set if metasploit_set else False
+        exploit_score, exploit_evidence = compute_exploitability(
+            cve_id, cve.get("cvssv3"), epss, in_kev, in_exploitdb, in_metasploit
+        )
+        github_urls = github_search_poc(cve_id) if GITHUB_TOKEN else []
+
+        enriched.append({
+            "cve_id": cve_id,
+            "description": cve.get("description", ""),
+            "cvssv3": cve.get("cvssv3"),
+            "severity": cve.get("severity"),
+            "epss": epss,
+            "references": circl.get("references", []),
+            "exploitability": exploit_score,
+            "exploit_evidence": exploit_evidence,
+            "in_kev": in_kev,
+            "in_exploitdb": in_exploitdb,
+            "in_metasploit": in_metasploit,
+            "github_pocs": github_urls
+        })
+    enriched.sort(key=lambda x: (-x["exploitability"], -float(x["cvssv3"] or 0)))
+    return enriched
+
+# ----------------- Service Fingerprint Engine -----------------
+SERVICE_FINGERPRINTS = [
+    ("openssh", re.compile(r"openssh[_-]?([\d.]+)", re.I)),
+    ("apache", re.compile(r"server:\s*apache/?\s*([\d.]+)", re.I)),
+    ("nginx", re.compile(r"server:\s*nginx/?\s*([\d.]+)", re.I)),
+    ("iis", re.compile(r"server:\s*microsoft-iis/?\s*([\d.]+)", re.I)),
+    ("mysql", re.compile(r"mysql.?ver(?:sion)?[:/ ]?([\d.]+)", re.I)),
+    ("pure-ftpd", re.compile(r"pure[- ]?ftpd[^\d]*([\d.]+)", re.I)),
+    ("vsftpd", re.compile(r"vsftpd[^\d]*([\d.]+)", re.I)),
+]
+
+def identify_service(port: int, banner: str | None) -> tuple[str, str, float, str]:
+    if not banner:
+        try:
+            name = socket.getservbyport(port)
+            return (name.lower(), "", 0.25, "port-based fallback")
+        except Exception:
+            return ("unknown", "", 0.15, "no banner")
+
+    text = banner.lower()
+    for name, rx in SERVICE_FINGERPRINTS:
+        m = rx.search(text)
+        if m:
+            ver = m.group(1) if m.lastindex else ""
+            return (name, ver, 0.9 if ver else 0.75, f"banner matched {name}")
+    m_server = re.search(r"server:\s*([^\r\n]+)", banner, re.I)
+    if m_server:
+        token = m_server.group(1).strip()
+        token_name = token.split()[0].lower()
+        return (token_name, "", 0.6, "server header")
+    if "ssh" in text:
+        return ("ssh", "", 0.6, "ssh token")
+    if "http" in text:
+        return ("http", "", 0.5, "http token")
+    return ("unknown", "", 0.2, "heuristic fallback")
+
+# ----------------- Banner Grabber & Port Scan -----------------
 def grab_banner(ip: str, port: int) -> str | None:
-    """Try to connect and fetch a banner, optionally sending a probe."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT)
+        sock.settimeout(SOCKET_TIMEOUT)
         sock.connect((ip, port))
-        # If it's TLS port (443/8443) we avoid plain send; attempt TLS handshake optionally:
+        data = b""
         if port in (443, 8443):
             try:
                 ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
                 with ctx.wrap_socket(sock, server_hostname=ip) as ss:
-                    # send a simple HTTP HEAD over TLS
-                    try:
-                        ss.send(b"HEAD / HTTP/1.0\r\nHost: %b\r\n\r\n" % ip.encode('utf-8'))
-                        data = ss.recv(2048)
-                    except Exception:
-                        data = b""
+                    ss.send(f"HEAD / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
+                    data = ss.recv(4096)
             except Exception:
-                # Fallback: we closed underlying socket above; return None
-                return None
+                pass
         else:
             if port in PROBES and PROBES[port]:
                 try:
                     sock.send(PROBES[port])
                 except Exception:
-                    # ignore send errors
                     pass
             try:
-                data = sock.recv(2048)
+                data = sock.recv(4096)
             except Exception:
-                data = b""
+                pass
             sock.close()
-
-        try:
-            text = data.decode('utf-8', errors='ignore').strip()
-            return text
-        except Exception:
-            return None
+        return data.decode("utf-8", errors="ignore").strip() if data else None
     except Exception:
         return None
 
-def scan_port(ip: str, port: int, results: list) -> None:
-    """Try to connect; if open, grab banner and identify service."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(TIMEOUT)
-        if s.connect_ex((ip, port)) == 0:
-            banner = grab_banner(ip, port)
-            service = identify_service(port, banner)
-            results.append((port, service, banner))
-        s.close()
-    except Exception:
-        pass
-
-def extract_version(text: str, pattern: str) -> str:
-    m = re.search(pattern, text, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-def identify_service(port: int, banner: str | None) -> tuple:
-    """
-    Heuristic identification that always returns (name, version).
-    name is normalized lower-case string.
-    """
-    if not banner:
-        # fallback to well-known service name if available
-        try:
-            name = socket.getservbyport(port)
-            return (name.lower(), "")
-        except OSError:
-            return ("unknown", "")
-
-    banner_lower = banner.lower()
-
-    # FTP
-    if port == 21:
-        if 'pure-ftpd' in banner_lower:
-            return ("pure-ftpd", extract_version(banner, r'pure-ftpd[^\d]*([\d.]+)'))
-        if 'vsftpd' in banner_lower:
-            return ("vsftpd", extract_version(banner, r'vsftpd[^\d]*([\d.]+)'))
-        if 'proftpd' in banner_lower:
-            return ("proftpd", extract_version(banner, r'proftpd[^\d]*([\d.]+)'))
-        return ("ftp", extract_version(banner, r'ftp[^\d]*([\d.]+)'))
-
-    # SSH
-    if port == 22:
-        if 'openssh' in banner_lower:
-            return ("openssh", extract_version(banner, r'openssh[_-]?([\d.]+)'))
-        return ("ssh", "")
-
-    # SMTP
-    if port == 25:
-        if 'postfix' in banner_lower:
-            return ("postfix", extract_version(banner, r'postfix[^\d]*([\d.]+)'))
-        if 'exim' in banner_lower:
-            return ("exim", extract_version(banner, r'exim[^\d]*([\d.]+)'))
-        if 'sendmail' in banner_lower:
-            return ("sendmail", extract_version(banner, r'sendmail[^\d]*([\d.]+)'))
-        return ("smtp", "")
-
-    # HTTP-family
-    if port in (80, 8080, 8443, 8888):
-        server_match = re.search(r'server:\s*([^\r\n]+)', banner, re.IGNORECASE)
-        if server_match:
-            server = server_match.group(1).strip()
-            server_lower = server.lower()
-            if 'apache' in server_lower or 'httpd' in server_lower:
-                return ("apache", extract_version(server, r'apache[/ ]([\d.]+)'))
-            if 'nginx' in server_lower:
-                return ("nginx", extract_version(server, r'nginx/([\d.]+)'))
-            if 'iis' in server_lower:
-                return ("iis", extract_version(server, r'iis[^\d]*([\d.]+)'))
-            # generic token
-            first = server.split()[0].lower()
-            return (first, "")
-        # fallback: look for product name anywhere
-        if 'apache' in banner_lower:
-            return ("apache", "")
-        if 'nginx' in banner_lower:
-            return ("nginx", "")
-        return ("http", "")
-
-    # POP3/IMAP
-    if port == 110:
-        if 'dovecot' in banner_lower:
-            return ("dovecot", "")
-        return ("pop3", "")
-    if port == 143:
-        if 'dovecot' in banner_lower:
-            return ("dovecot", "")
-        return ("imap", "")
-
-    # MySQL
-    if port == 3306:
-        m = re.search(r'([\d]+\.[\d]+\.[\d]+)', banner)
-        if m:
-            return ("mysql", m.group(1))
-        return ("mysql", "")
-
-    # Default: first line of banner
-    first_line = banner.split('\n', 1)[0].strip()
-    if first_line:
-        token = re.split(r'[\s/;()]+', first_line.lower())[0]
-        return (token[:50], "")
-    return ("unknown", "")
-
-# ---------------------------- Improved CVE Lookup -------------------------
-SERVICE_MAP = {
-    'apache': [('apache', 'http_server'), ('apache', 'httpd'), ('apache', 'apache')],
-    'nginx': [('nginx', 'nginx')],
-    'openssh': [('openbsd', 'openssh'), ('openssh', 'openssh')],
-    'pure-ftpd': [('pureftpd', 'pure-ftpd')],
-    'vsftpd': [('vsftpd', 'vsftpd')],
-    'proftpd': [('proftpd', 'proftpd')],
-    'mysql': [('mysql', 'mysql')],
-    'dovecot': [('dovecot', 'dovecot')],
-    'postfix': [('postfix', 'postfix')],
-    'exim': [('exim', 'exim')],
-    'sendmail': [('sendmail', 'sendmail')],
-    'iis': [('microsoft', 'iis'), ('microsoft', 'http_server')],
-    'tomcat': [('apache', 'tomcat')],
-    'ftp': [('', 'ftp')],
-    'smtp': [('', 'smtp')],
-    'pop3': [('', 'pop3')],
-    'imap': [('', 'imap')],
-    'http': [('', 'http_server'), ('', 'http')],
-    'https': [('', 'http_server'), ('', 'http')],
-}
-
-def normalize_service_name(s: str | None) -> str:
-    if not s:
-        return ""
-    return re.sub(r'[^a-z0-9]+', '_', s.lower()).strip('_')
-
-def get_cve_enrichment(cve_id: str) -> tuple | None:
-    """Retrieve EPSS score and references from circl_enrich table."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT exploit_predictions, external_refs FROM circl_enrich WHERE cve_id = ?", (cve_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def find_cves(service_name: str | None, version: str | None = None) -> list:
-    """
-    Forgiving lookup:
-      - normalizes service_name
-      - tries vendor/product exact and LIKE
-      - falls back to searching descriptions
-    Returns list of (cve_id, short_description, cvss_score, severity, epss)
-    """
-    if not service_name:
-        return []
-
-    svc = normalize_service_name(service_name)
-    candidates = SERVICE_MAP.get(svc, [(None, svc)])
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    all_cves: dict[str, tuple] = {}
-
-    def run(q: str, params: tuple = ()):
-        if DEBUG:
-            print("DEBUG SQL:", q, params)
-        try:
-            c.execute(q, params)
-            for row in c.fetchall():
-                cid = row[0]
-                all_cves[cid] = row
-        except Exception as e:
-            if DEBUG:
-                print("SQL error:", e)
-
-    for vendor, product in candidates:
-        if vendor:
-            # vendor + product exact
-            run('''
-                SELECT c.id, c.description, c.cvssv3, c.severity
-                FROM nvd_cves c
-                JOIN products p ON c.id = p.cve_id
-                WHERE p.vendor = ? AND p.product = ?
-            ''', (vendor, product))
-            # vendor exact, product LIKE
-            run('''
-                SELECT c.id, c.description, c.cvssv3, c.severity
-                FROM nvd_cves c
-                JOIN products p ON c.id = p.cve_id
-                WHERE p.vendor = ? AND p.product LIKE ?
-            ''', (vendor, f'%{product}%'))
-            # vendor LIKE, product LIKE (broader)
-            run('''
-                SELECT c.id, c.description, c.cvssv3, c.severity
-                FROM nvd_cves c
-                JOIN products p ON c.id = p.cve_id
-                WHERE p.vendor LIKE ? AND p.product LIKE ?
-            ''', (f'%{vendor}%', f'%{product}%'))
-        else:
-            run('''
-                SELECT c.id, c.description, c.cvssv3, c.severity
-                FROM nvd_cves c
-                JOIN products p ON c.id = p.cve_id
-                WHERE p.product LIKE ?
-            ''', (f'%{product}%',))
-
-    # fallback: search descriptions for the token
-    run('''
-        SELECT c.id, c.description, c.cvssv3, c.severity
-        FROM nvd_cves c
-        WHERE lower(c.description) LIKE ?
-        LIMIT 200
-    ''', (f'%{svc}%',))
-
-    conn.close()
-
+def scan_ports(ip: str, ports: list[int]) -> list[tuple[int, tuple[str, str, float, str], str | None]]:
     results = []
-    for cid, row in all_cves.items():
-        _, desc, cvss, sev = row
-        desc_short = (desc or "")[:140]
-        # get enrichment
-        enrich = get_cve_enrichment(cid)
-        epss = enrich[0] if enrich and enrich[0] else "N/A"
-        results.append((cid, desc_short + ("..." if len(desc or "") > 140 else ""), cvss, sev, epss))
+    def worker(p):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(SOCKET_TIMEOUT)
+            if s.connect_ex((ip, p)) == 0:
+                b = grab_banner(ip, p)
+                svc = identify_service(p, b)
+                return (p, svc, b)
+        except Exception:
+            return None
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        return None
 
-    results.sort(key=lambda x: (-(x[2] or 0), x[0]))
+    with ThreadPoolExecutor(max_workers=min(THREAD_POOL_SIZE, len(ports))) as ex:
+        futures = {ex.submit(worker, p): p for p in ports}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                results.append(r)
+    results.sort(key=lambda x: x[0])
     return results
 
-# ---------------------------- Additional Vulnerability Checks --------------
-def http_get(url: str, timeout: int = 5) -> tuple[int | None, str | None]:
-    """Perform a GET request, return (status_code, content) or (None, None) on failure."""
-    try:
-        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        # Disable SSL certificate verification for simplicity (may cause warnings)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with urlopen(req, context=ctx, timeout=timeout) as resp:
-            return resp.status, resp.read().decode('utf-8', errors='ignore')
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return None, None
+# ----------------- OS Detection -----------------
+OS_SIGNATURES = [
+    {"name": "Linux", "ttl_max": 64, "window": [5840, 29200, 64240]},
+    {"name": "Windows", "ttl_max": 128, "window": [8192, 65535]},
+    {"name": "FreeBSD", "ttl_max": 64, "window": [65535]},
+]
 
+def get_ttl(ip: str) -> int | None:
+    param = "-n" if os.name == "nt" else "-c"
+    try:
+        output = subprocess.check_output(["ping", param, "1", ip], stderr=subprocess.STDOUT, timeout=5)
+        out = output.decode(errors="ignore")
+        m = re.search(r"ttl[=|:](\d+)", out, re.I)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+def advanced_os_detect(ttl: int | None, tcp_window: int | None = None, banner: str | None = None) -> tuple[str, int]:
+    scores = {}
+    for sig in OS_SIGNATURES:
+        s = 0
+        if ttl and ttl <= sig["ttl_max"]:
+            s += 2
+        if tcp_window and tcp_window in sig["window"]:
+            s += 2
+        if banner and sig["name"].lower() in (banner or "").lower():
+            s += 1
+        scores[sig["name"]] = s
+    if not scores:
+        return ("Unknown", 0)
+    best = max(scores, key=scores.get)
+    confidence = min(100, scores[best] * 25)
+    return (best, confidence) if confidence > 0 else ("Unknown", 0)
+
+# ----------------- Web + FTP checks -----------------
 def check_web_interesting(ip: str, port: int, service_name: str) -> list:
-    """Check for interesting files on a web server."""
     findings = []
     protocol = "https" if port in (443, 8443) else "http"
-    base_url = f"{protocol}://{ip}:{port}"
-
-    # Check interesting paths
+    base = f"{protocol}://{ip}:{port}"
     for path in WEB_INTERESTING_PATHS:
-        url = base_url + path
-        status, content = http_get(url)
+        url = base + path
+        status, content = http_get(url, timeout=6)
         if status == 200:
             findings.append({
-                'type': 'Interesting File',
-                'description': f"Found accessible file: {path}",
-                'url': url,
-                'risk': 'Info' if path in ['/robots.txt', '/sitemap.xml'] else 'Medium'
+                "type": "Interesting File",
+                "path": path,
+                "url": url,
+                "risk": "Info" if path in ["/robots.txt", "/sitemap.xml"] else "Medium",
+                "confidence": 0.85
             })
         elif status == 403:
             findings.append({
-                'type': 'Forbidden',
-                'description': f"Access forbidden (might exist): {path}",
-                'url': url,
-                'risk': 'Low'
+                "type": "Forbidden",
+                "path": path,
+                "url": url,
+                "risk": "Low",
+                "confidence": 0.6
             })
-
-    # Check for directory listing
     for path in WEB_LISTING_DIRS:
-        url = base_url + path
-        status, content = http_get(url)
+        url = base + path
+        status, content = http_get(url, timeout=6)
         if status == 200 and content and "Index of" in content:
             findings.append({
-                'type': 'Directory Listing',
-                'description': f"Directory listing enabled at {path}",
-                'url': url,
-                'risk': 'Medium'
+                "type": "Directory Listing",
+                "path": path,
+                "url": url,
+                "risk": "Medium",
+                "confidence": 0.9
             })
-
-    # Check for server info leakage via /server-status or /server-info (if accessible)
-    if service_name in ['apache', 'http']:
-        for path in ['/server-status', '/server-info']:
-            url = base_url + path
-            status, content = http_get(url)
+    if service_name in ["apache", "http"]:
+        for p in ["/server-status", "/server-info"]:
+            url = base + p
+            status, content = http_get(url, timeout=6)
             if status == 200:
                 findings.append({
-                    'type': 'Server Info Leak',
-                    'description': f"Server information page exposed: {path}",
-                    'url': url,
-                    'risk': 'Medium'
+                    "type": "Server Info Leak",
+                    "path": p,
+                    "url": url,
+                    "risk": "Medium",
+                    "confidence": 0.9
                 })
-
     return findings
 
 def check_ftp_anonymous(ip: str, port: int) -> list:
-    """Check if FTP allows anonymous login."""
     findings = []
     try:
+        import ftplib
         ftp = ftplib.FTP()
-        ftp.connect(ip, port, timeout=TIMEOUT)
-        ftp.login('anonymous', 'anonymous@')
-        # Try to list files
+        ftp.connect(ip, port, timeout=SOCKET_TIMEOUT)
+        ftp.login("anonymous", "anonymous@")
         files = ftp.nlst()
         ftp.quit()
         findings.append({
-            'type': 'Anonymous FTP',
-            'description': 'Anonymous FTP login allowed',
-            'details': f"Files/dirs: {', '.join(files[:5])}" if files else "No files visible",
-            'risk': 'High'
+            "type": "Anonymous FTP",
+            "details": f"Files/dirs: {', '.join(files[:5])}" if files else "No files visible",
+            "risk": "High",
+            "confidence": 0.95
         })
     except Exception:
         pass
     return findings
 
-def check_service_vulns(ip: str, port: int, service_name: str, banner: str | None) -> list:
-    """Run additional vulnerability checks based on service type."""
-    findings = []
-    # Web services
-    if service_name in ['http', 'apache', 'nginx', 'iis', 'tomcat'] or port in (80, 443, 8080, 8443, 8888):
-        findings.extend(check_web_interesting(ip, port, service_name))
-    # FTP
-    if service_name in ['ftp', 'vsftpd', 'proftpd', 'pure-ftpd'] or port == 21:
-        findings.extend(check_ftp_anonymous(ip, port))
-    # Add more checks for other services as needed
+# ----------------- Reporting -----------------
+def generate_json_report(meta: dict, services: list, findings: list, out_file: str) -> None:
+    report = {"meta": meta, "services": services, "findings": findings}
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    safe_print(f"[*] JSON report saved to {out_file}")
 
-    return findings
+def generate_html_report(json_file: str, out_html: str) -> None:
+    with open(json_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    html = []
+    html.append("<html><head><meta charset='utf-8'><title>Vuln Scan Report</title></head><body>")
+    html.append(f"<h1>Scan: {data['meta'].get('target')} @ {data['meta'].get('time')}</h1>")
+    for svc in data.get("services", []):
+        html.append(f"<h2>{svc['port']}/tcp - {svc['service']} {svc.get('version','')}</h2>")
+        html.append("<pre>")
+        html.append((svc.get("banner") or "")[:2000])
+        html.append("</pre>")
+        if svc.get("cves"):
+            html.append("<ul>")
+            for c in svc["cves"]:
+                html.append(f"<li><b>{c['cve_id']}</b> {c.get('severity')} CVSS:{c.get('cvssv3')} Exploit:{int(c.get('exploitability',0)*100)}% Evidence:{', '.join(c.get('exploit_evidence',[])[:3])}</li>")
+            html.append("</ul>")
+    html.append("</body></html>")
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
+    safe_print(f"[*] HTML report saved to {out_html}")
 
-# ---------------------------- Scanning ---------------------------------------
-def scan_target(target: str) -> None:
-    ip = resolve_host(target)
-    if not ip:
-        print(f"[-] Could not resolve {target}")
-        return
+def print_console_report(meta: dict, services: list, findings: list) -> None:
+    """Print a detailed report to the console with CVEs in a table."""
+    print("\n" + "="*80)
+    print(" VULNERABILITY SCAN REPORT")
+    print("="*80)
+    print(f"Target: {meta['target']} ({meta['ip']})")
+    print(f"Scan time: {meta['time']}")
+    print(f"OS guess: {meta.get('os_guess', 'Unknown')} (confidence {meta.get('os_confidence', 0)}%)")
+    print("-"*80)
 
-    print(f"\n[*] Target IP: {ip}")
+    if not services:
+        print("No open ports found.")
+    else:
+        for svc in services:
+            print(f"\nPort {svc['port']}/tcp - {svc['service']} {svc.get('version', '')}")
+            if svc.get('banner'):
+                banner_preview = svc['banner'][:200].replace('\n', ' ')
+                if len(svc['banner']) > 200:
+                    banner_preview += "..."
+                print(f"  Banner: {banner_preview}")
 
-    ttl = get_ttl(ip)
-    os_guess = guess_os(ttl)
-    print(f"[*] OS Fingerprint: TTL={ttl} -> {os_guess}")
+            if svc.get('cves'):
+                print("  CVEs (top 10 by exploitability):")
+                # Prepare table headers and rows
+                headers = ["CVE ID", "Severity", "CVSS", "Exploitability", "Evidence"]
+                rows = []
+                for c in svc['cves'][:10]:
+                    cve_id = c['cve_id']
+                    severity = c.get('severity', 'N/A') or 'N/A'
+                    cvss = str(c.get('cvssv3', 'N/A'))
+                    exploit = f"{int(c['exploitability']*100)}%"
+                    evidence = ', '.join(c['exploit_evidence'][:3])
+                    if len(evidence) > 30:
+                        evidence = evidence[:27] + "..."
+                    rows.append([cve_id, severity, cvss, exploit, evidence])
 
-    print("[*] Scanning common ports...")
-    results: list = []
-    threads: list[threading.Thread] = []
+                # Calculate column widths
+                col_widths = [max(len(str(row[i])) for row in rows + [headers]) for i in range(len(headers))]
+                # Ensure minimum widths
+                col_widths = [max(w, len(h)) for w, h in zip(col_widths, headers)]
 
-    for port in COMMON_PORTS:
-        t = threading.Thread(target=scan_port, args=(ip, port, results))
-        threads.append(t)
-        t.start()
-        if len(threads) >= THREADS:
-            for th in threads:
-                th.join()
-            threads = []
-    for th in threads:
-        th.join()
-
-    if not results:
-        print("    No open ports found.")
-        return
-
-    print("\n[+] Open Ports & Services:")
-    all_findings = []
-    for port, service, banner in sorted(results, key=lambda x: x[0]):
-        if isinstance(service, tuple):
-            service_name, service_version = service
-        else:
-            service_name, service_version = (service, "")
-
-        service_display = f"{service_name} {service_version}".strip()
-        print(f"    {port}/tcp : {service_display}")
-        if banner:
-            banner_preview = banner[:180] + ("..." if len(banner) > 180 else "")
-            print(f"        Banner: {banner_preview}")
-
-        cves = find_cves(service_name, service_version)
-        if cves:
-            print(f"        Potential CVEs ({len(cves)} found):")
-            for cve_id, desc, score, sev, epss in cves[:5]:
-                epss_disp = f" (EPSS: {epss})" if epss and epss != "N/A" else ""
-                print(f"            {cve_id} | {sev} (CVSS: {score}){epss_disp}")
-                if DEBUG:
-                    print(f"                {desc}")
-        else:
-            print("        No CVEs found in local database.")
-
-        # Additional service-specific checks
-        findings = check_service_vulns(ip, port, service_name, banner)
-        if findings:
-            all_findings.extend(findings)
-            for f in findings:
-                risk = f.get('risk', 'Info')
-                print(f"        [!] {risk}: {f['description']}")
-
-    if all_findings:
-        print("\n[!] Additional Vulnerabilities / Interesting Findings:")
-        for idx, f in enumerate(all_findings, 1):
-            print(f"    {idx}. [{f['risk']}] {f['description']}")
-            if 'url' in f:
-                print(f"        URL: {f['url']}")
-            if 'details' in f:
-                print(f"        Details: {f['details']}")
-
-    print("\n[*] Network Map:")
-    print(f"    Scanned host: {target} ({ip})")
-    print(f"    Open ports: {len(results)}")
-
-# ---------------------------- Menu & Donation -------------------------------
-def show_donation() -> None:
-    print("\n" + "="*50)
-    print("Support the developer:")
-    print(f"UPI ID: {DONATION_UPI}")
-    print("="*50 + "\n")
-
-def menu() -> None:
-    while True:
-        print("\n--- Vulnerability Scanner (NVD + CIRCL) ---")
-        print("1. Update CVE Database (NVD + CIRCL)")
-        print("2. Scan Target")
-        print("3. Donation Info")
-        print("4. Show CVE Count")
-        print("5. Exit")
-        choice = input("Select option (1-5): ").strip()
-
-        if choice == '1':
-            update_all()
-        elif choice == '2':
-            target = input("Enter target IP or hostname: ").strip()
-            if target:
-                scan_target(target)
+                # Print top border
+                print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
+                # Print header
+                header_line = "  |"
+                for i, h in enumerate(headers):
+                    header_line += f" {h:<{col_widths[i]}} |"
+                print(header_line)
+                # Print separator
+                print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
+                # Print rows
+                for row in rows:
+                    line = "  |"
+                    for i, cell in enumerate(row):
+                        line += f" {str(cell):<{col_widths[i]}} |"
+                    print(line)
+                # Print bottom border
+                print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
             else:
-                print("[-] No target entered.")
-        elif choice == '3':
-            show_donation()
-        elif choice == '4':
-            show_cve_count()
-        elif choice == '5':
-            print("[*] Exiting. Goodbye!")
+                print("  No CVEs found for this service.")
+
+    if findings:
+        print("\n" + "-"*80)
+        print("ADDITIONAL FINDINGS")
+        print("-"*80)
+        for f in findings:
+            print(f"Port {f['port']}/{f['service']} - {f['type']} (Risk: {f.get('risk', 'Unknown')})")
+            if f.get('url'):
+                print(f"  URL: {f['url']}")
+            if f.get('details'):
+                print(f"  Details: {f['details']}")
+    else:
+        print("\nNo additional findings.")
+
+    print("="*80 + "\n")
+
+# ----------------- Scan Orchestration -----------------
+def scan_target(target: str, ports: list[int] | None = None, out_json: str | None = None, out_html: str | None = None) -> None:
+    global _nvd_cache, _circl_cache, _kev_set, _exploitdb_set, _metasploit_set
+    _nvd_cache = {}
+    _circl_cache = {}
+    _kev_set = None
+    _exploitdb_set = None
+    _metasploit_set = None
+
+    if ports is None:
+        ports = COMMON_PORTS
+    try:
+        ip = socket.gethostbyname(target)
+    except Exception:
+        safe_print("[-] Could not resolve target:", target)
+        return
+
+    safe_print(f"[*] Target IP: {ip}")
+    ttl = get_ttl(ip)
+    os_guess, os_conf = advanced_os_detect(ttl, None, None)
+    safe_print(f"[*] OS guess: TTL={ttl} -> {os_guess} (Confidence {os_conf}%)")
+
+    safe_print("[*] Scanning common ports...")
+    scan_results = scan_ports(ip, ports)
+
+    safe_print("[*] Fetching CISA KEV, Exploit-DB, Metasploit indices...")
+    kev_set = fetch_kev_set()
+    exploitdb_set = fetch_exploitdb_set()
+    metasploit_set = fetch_metasploit_set()
+    safe_print(f"    KEV: {len(kev_set)} entries, Exploit-DB: {len(exploitdb_set)}, Metasploit: {len(metasploit_set)}")
+
+    services_report = []
+    findings = []
+
+    for port, svc_tuple, banner in scan_results:
+        name, ver, svc_conf, svc_reason = svc_tuple
+        safe_print(f"    {port}/tcp : {name} {ver} (Confidence: {int(svc_conf*100)}% — {svc_reason})")
+        if banner:
+            banner_preview = (banner[:480] + "...") if len(banner) > 480 else banner
+            safe_print(f"        Banner: {banner_preview}")
+
+        cves = find_cves_online(name, ver if ver else None,
+                                kev_set=kev_set, exploitdb_set=exploitdb_set, metasploit_set=metasploit_set)
+
+        svc_cves = []
+        for c in cves[:20]:
+            safe_print(f"        {c['cve_id']} | {c.get('severity')} (CVSS: {c.get('cvssv3')}) — Exploitability: {int(c['exploitability']*100)}% — Evidence: {', '.join(c['exploit_evidence'][:3])}")
+            if c.get("github_pocs"):
+                safe_print(f"            GitHub PoCs: {', '.join(c['github_pocs'][:2])}")
+            svc_cves.append(c)
+
+        svc_findings = []
+        if name in ("http", "https", "apache", "nginx") or port in (80, 443, 8080, 8443):
+            svc_findings.extend(check_web_interesting(ip, port, name))
+        if name in ("ftp", "pure-ftpd", "vsftpd") or port == 21:
+            svc_findings.extend(check_ftp_anonymous(ip, port))
+
+        for f in svc_findings:
+            findings.append({"port": port, "service": name, **f})
+
+        services_report.append({
+            "port": port,
+            "service": name,
+            "version": ver,
+            "banner": banner,
+            "cves": svc_cves,
+            "findings": svc_findings
+        })
+
+    meta = {
+        "target": target,
+        "ip": ip,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "os_guess": os_guess,
+        "os_confidence": os_conf
+    }
+
+    # Print console report
+    print_console_report(meta, services_report, findings)
+
+    # Generate files only if requested
+    if out_json:
+        generate_json_report(meta, services_report, findings, out_json)
+    if out_html:
+        if out_json:
+            generate_html_report(out_json, out_html)
+        else:
+            safe_print("[-] HTML report requires a JSON file. Please specify an output JSON filename.")
+
+    safe_print(f"[*] Scan complete. Open ports: {len(services_report)}")
+
+# ----------------- Menu -----------------
+def menu():
+    safe_print("Vulnerability Scanner v2 (Online CVE Lookup) - Menu")
+    while True:
+        safe_print("\n--- Menu ---")
+        safe_print("1. Scan Target")
+        safe_print("2. Exit")
+        choice = input("Select option (1-2): ").strip()
+        if choice == "1":
+            target = input("Enter target IP or hostname: ").strip()
+            ports_str = input("Enter ports comma-separated or leave blank for default: ").strip()
+            out_json = input("Output JSON filename (leave blank for auto): ").strip() or None
+            out_html = input("Output HTML filename (leave blank for none): ").strip() or None
+            if not target:
+                safe_print("[-] No target provided.")
+                continue
+            ports = None
+            if ports_str:
+                try:
+                    ports = [int(p.strip()) for p in ports_str.split(",") if p.strip()]
+                except Exception:
+                    safe_print("[-] Invalid ports input.")
+                    continue
+            scan_target(target, ports, out_json, out_html)
+        elif choice == "2":
+            safe_print("Exiting. Goodbye.")
             break
         else:
-            print("[-] Invalid option.")
+            safe_print("Invalid option. Try again.")
 
-# ---------------------------- Main ------------------------------------------
 if __name__ == "__main__":
-    # Ensure DB exists (but do not auto-download data)
-    if not os.path.exists(DB_FILE):
-        init_database()
-        print("[*] Database created. Please run option 1 to update.")
     try:
         menu()
     except KeyboardInterrupt:
-        print("\n[*] Interrupted by user. Exiting.")
-        sys.exit(0)
+        safe_print("\nInterrupted by user. Exiting.")
+    except Exception:
+        traceback.print_exc()

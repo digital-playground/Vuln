@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-vuln_online.py - Vulnerability Scanner v2 (Online CVE Lookup)
+vuln_online.py - Vulnerability Scanner v3 (Online CVE Lookup + Web Crawler)
 Prints a detailed report to the console with CVEs in a table; optional JSON/HTML output.
+Includes a recursive web crawler and basic web vulnerability checks.
 """
 from __future__ import annotations
 import os
@@ -15,10 +16,12 @@ import subprocess
 import csv
 import traceback
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
+from typing import List, Tuple, Optional, Dict, Set, Any
 
 try:
     import requests
@@ -38,6 +41,9 @@ THREAD_POOL_SIZE = 80
 SOCKET_TIMEOUT = 3
 RATE_LIMIT = 6
 CIRCL_DELAY = 0.5
+CRAWL_MAX_PAGES = 50
+CRAWL_DELAY = 0.1
+WEB_TEST_TIMEOUT = 8
 
 COMMON_PORTS = [
     21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
@@ -58,7 +64,8 @@ PROBES = {
 WEB_INTERESTING_PATHS = [
     "/robots.txt", "/sitemap.xml", "/.git/HEAD", "/.env",
     "/phpinfo.php", "/info.php", "/test.php", "/server-status",
-    "/server-info", "/phpmyadmin/", "/admin/", "/login", "/wp-admin"
+    "/server-info", "/phpmyadmin/", "/admin/", "/login", "/wp-admin",
+    "/backup.zip", "/backup.tar.gz", "/config.php", "/config.bak",
 ]
 WEB_LISTING_DIRS = ["/images/", "/css/", "/uploads/", "/backup/", "/logs/"]
 
@@ -66,7 +73,7 @@ WEB_LISTING_DIRS = ["/images/", "/css/", "/uploads/", "/backup/", "/logs/"]
 def http_get(url: str, timeout: int = 10) -> tuple[int | None, str | None]:
     """Fallback HTTP GET using urllib (if requests not available)."""
     try:
-        req = Request(url, headers={"User-Agent": "vuln-scanner-v2/1.0"})
+        req = Request(url, headers={"User-Agent": "vuln-scanner-v3/1.0"})
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -94,8 +101,7 @@ def safe_print(*args, **kwargs):
     except Exception:
         sys.stdout.write(" ".join(map(str, args)) + ("\n" if not kwargs.get("end") else ""))
 
-# ----------------- Online CVE Fetching -----------------
-# In‑memory caches for a single scan
+# ----------------- Online CVE Fetching (unchanged) -----------------
 _nvd_cache = {}
 _circl_cache = {}
 _kev_set = None
@@ -117,7 +123,7 @@ def fetch_nvd_cves(product: str, version: str = None) -> list:
         keywords.append(version)
     query = " ".join(keywords)
     params = {"keywordSearch": query, "resultsPerPage": 50, "startIndex": 0}
-    headers = {"User-Agent": "vuln-scanner-v2/1.0"}
+    headers = {"User-Agent": "vuln-scanner-v3/1.0"}
     if NVD_API_KEY:
         headers["apiKey"] = NVD_API_KEY
 
@@ -287,7 +293,7 @@ def github_search_poc(cve_id: str) -> list[str]:
     if not GITHUB_TOKEN or not requests:
         return []
     try:
-        headers = {"User-Agent": "vuln-scanner-v2", "Authorization": f"token {GITHUB_TOKEN}"}
+        headers = {"User-Agent": "vuln-scanner-v3", "Authorization": f"token {GITHUB_TOKEN}"}
         url = f"https://api.github.com/search/code?q={quote(cve_id)}+in:file&per_page=20"
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
@@ -375,7 +381,7 @@ def find_cves_online(service_name: str, version: str = None,
     enriched.sort(key=lambda x: (-x["exploitability"], -float(x["cvssv3"] or 0)))
     return enriched
 
-# ----------------- Service Fingerprint Engine -----------------
+# ----------------- Service Fingerprint Engine (unchanged) -----------------
 SERVICE_FINGERPRINTS = [
     ("openssh", re.compile(r"openssh[_-]?([\d.]+)", re.I)),
     ("apache", re.compile(r"server:\s*apache/?\s*([\d.]+)", re.I)),
@@ -411,7 +417,7 @@ def identify_service(port: int, banner: str | None) -> tuple[str, str, float, st
         return ("http", "", 0.5, "http token")
     return ("unknown", "", 0.2, "heuristic fallback")
 
-# ----------------- Banner Grabber & Port Scan -----------------
+# ----------------- Banner Grabber & Port Scan (unchanged) -----------------
 def grab_banner(ip: str, port: int) -> str | None:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -471,7 +477,7 @@ def scan_ports(ip: str, ports: list[int]) -> list[tuple[int, tuple[str, str, flo
     results.sort(key=lambda x: x[0])
     return results
 
-# ----------------- OS Detection -----------------
+# ----------------- OS Detection (unchanged) -----------------
 OS_SIGNATURES = [
     {"name": "Linux", "ttl_max": 64, "window": [5840, 29200, 64240]},
     {"name": "Windows", "ttl_max": 128, "window": [8192, 65535]},
@@ -507,16 +513,213 @@ def advanced_os_detect(ttl: int | None, tcp_window: int | None = None, banner: s
     confidence = min(100, scores[best] * 25)
     return (best, confidence) if confidence > 0 else ("Unknown", 0)
 
-# ----------------- Web + FTP checks -----------------
-def check_web_interesting(ip: str, port: int, service_name: str) -> list:
+# ----------------- Web Crawler & Deep Assessment -----------------
+class WebCrawler:
+    def __init__(self, base_url: str, max_pages: int = 50, delay: float = 0.1):
+        self.base_url = base_url
+        self.max_pages = max_pages
+        self.delay = delay
+        self.visited: Set[str] = set()
+        self.to_visit: List[str] = [base_url]
+        self.forms: List[Dict] = []
+        self.pages: List[Dict] = []
+        self.session = requests.Session() if requests else None
+        self.session.headers.update({"User-Agent": "vuln-scanner-v3/1.0"}) if self.session else None
+
+    def normalize_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        # Remove fragments
+        return parsed._replace(fragment='').geturl()
+
+    def is_same_domain(self, url: str) -> bool:
+        base_netloc = urlparse(self.base_url).netloc
+        other_netloc = urlparse(url).netloc
+        return base_netloc == other_netloc
+
+    def extract_links(self, html: str, source_url: str) -> List[str]:
+        links = []
+        # Simple regex to find href attributes
+        for match in re.finditer(r'href=[\'"]?([^\'" >]+)', html, re.I):
+            link = match.group(1)
+            absolute = urljoin(source_url, link)
+            normalized = self.normalize_url(absolute)
+            if self.is_same_domain(normalized) and normalized not in self.visited:
+                links.append(normalized)
+        return links
+
+    def extract_forms(self, html: str, source_url: str) -> List[Dict]:
+        forms = []
+        # Find each form tag
+        form_pattern = re.compile(r'<form.*?</form>', re.DOTALL | re.I)
+        input_pattern = re.compile(r'<input.*?>', re.I)
+        for form_match in form_pattern.finditer(html):
+            form_html = form_match.group()
+            action_match = re.search(r'action=[\'"]?([^\'" >]+)', form_html, re.I)
+            action = action_match.group(1) if action_match else source_url
+            method_match = re.search(r'method=[\'"]?([^\'" >]+)', form_html, re.I)
+            method = method_match.group(1).upper() if method_match else "GET"
+            inputs = []
+            for inp in input_pattern.finditer(form_html):
+                inp_html = inp.group()
+                name_match = re.search(r'name=[\'"]?([^\'" >]+)', inp_html, re.I)
+                if name_match:
+                    name = name_match.group(1)
+                    type_match = re.search(r'type=[\'"]?([^\'" >]+)', inp_html, re.I)
+                    inp_type = type_match.group(1) if type_match else "text"
+                    inputs.append({"name": name, "type": inp_type})
+            forms.append({
+                "action": urljoin(source_url, action),
+                "method": method,
+                "inputs": inputs,
+                "source_url": source_url
+            })
+        return forms
+
+    def crawl(self) -> Tuple[List[Dict], List[Dict]]:
+        """Crawl pages and return (pages_metadata, forms_found)"""
+        safe_print(f"[*] Starting crawl of {self.base_url}")
+        pages = 0
+        while self.to_visit and pages < self.max_pages:
+            url = self.to_visit.pop(0)
+            if url in self.visited:
+                continue
+            self.visited.add(url)
+            time.sleep(self.delay)
+            try:
+                if self.session:
+                    resp = self.session.get(url, timeout=WEB_TEST_TIMEOUT, verify=False)
+                else:
+                    code, content = http_get(url, timeout=WEB_TEST_TIMEOUT)
+                    if code != 200:
+                        continue
+                    resp = type('Resp', (), {'status_code': code, 'text': content})()
+                if resp.status_code != 200:
+                    continue
+                html = resp.text
+                pages += 1
+                self.pages.append({"url": url, "size": len(html)})
+                # Extract links and forms
+                new_links = self.extract_links(html, url)
+                for link in new_links:
+                    if link not in self.visited and link not in self.to_visit:
+                        self.to_visit.append(link)
+                new_forms = self.extract_forms(html, url)
+                self.forms.extend(new_forms)
+                safe_print(f"    Crawled {url} (forms: {len(new_forms)})")
+            except Exception as e:
+                safe_print(f"    [!] Error crawling {url}: {e}")
+        safe_print(f"[*] Crawling finished. Visited {len(self.visited)} pages, found {len(self.forms)} forms.")
+        return self.pages, self.forms
+
+def test_xss_payload(session, url: str, method: str, inputs: List[Dict]) -> List[Dict]:
+    findings = []
+    payload = "<script>alert('XSS')</script>"
+    data = {}
+    for inp in inputs:
+        if inp["type"] in ["text", "search", "textarea", "hidden"]:
+            data[inp["name"]] = payload
+    if not data:
+        return findings
+    try:
+        if method.upper() == "GET":
+            resp = session.get(url, params=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        else:
+            resp = session.post(url, data=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        if payload in resp.text:
+            findings.append({
+                "type": "Reflected XSS",
+                "url": url,
+                "method": method,
+                "parameter": list(data.keys()),
+                "payload": payload,
+                "risk": "High",
+                "confidence": 0.8
+            })
+    except Exception:
+        pass
+    return findings
+
+def test_sqli_error(session, url: str, method: str, inputs: List[Dict]) -> List[Dict]:
+    findings = []
+    payload = "' OR '1'='1"
+    # Common error messages
+    error_patterns = [
+        "you have an error in your sql",
+        "warning: mysql",
+        "unclosed quotation mark",
+        "odbc driver",
+        "sqlite",
+    ]
+    data = {}
+    for inp in inputs:
+        if inp["type"] in ["text", "search", "textarea", "hidden"]:
+            data[inp["name"]] = payload
+    if not data:
+        return findings
+    try:
+        if method.upper() == "GET":
+            resp = session.get(url, params=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        else:
+            resp = session.post(url, data=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        content = resp.text.lower()
+        for pattern in error_patterns:
+            if pattern in content:
+                findings.append({
+                    "type": "SQL Injection (Error-based)",
+                    "url": url,
+                    "method": method,
+                    "parameter": list(data.keys()),
+                    "payload": payload,
+                    "risk": "Critical",
+                    "confidence": 0.7
+                })
+                break
+    except Exception:
+        pass
+    return findings
+
+def test_path_traversal(session, url: str, method: str, inputs: List[Dict]) -> List[Dict]:
+    findings = []
+    payload = "../../../../etc/passwd"
+    data = {}
+    for inp in inputs:
+        if inp["type"] in ["text", "search", "textarea", "hidden"]:
+            data[inp["name"]] = payload
+    if not data:
+        return findings
+    try:
+        if method.upper() == "GET":
+            resp = session.get(url, params=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        else:
+            resp = session.post(url, data=data, timeout=WEB_TEST_TIMEOUT, verify=False)
+        if "root:" in resp.text and "bin:" in resp.text:
+            findings.append({
+                "type": "Path Traversal",
+                "url": url,
+                "method": method,
+                "parameter": list(data.keys()),
+                "payload": payload,
+                "risk": "High",
+                "confidence": 0.9
+            })
+    except Exception:
+        pass
+    return findings
+
+def perform_web_assessment(ip: str, port: int, service_name: str) -> List[Dict]:
     findings = []
     protocol = "https" if port in (443, 8443) else "http"
-    base = f"{protocol}://{ip}:{port}"
+    base_url = f"{protocol}://{ip}:{port}"
+    safe_print(f"[*] Starting deep web assessment for {base_url}")
+
+    # 1. Basic interesting files (already done, but we'll do it here too)
     for path in WEB_INTERESTING_PATHS:
-        url = base + path
+        url = base_url + path
         status, content = http_get(url, timeout=6)
         if status == 200:
             findings.append({
+                "port": port,
+                "service": service_name,
                 "type": "Interesting File",
                 "path": path,
                 "url": url,
@@ -525,57 +728,60 @@ def check_web_interesting(ip: str, port: int, service_name: str) -> list:
             })
         elif status == 403:
             findings.append({
+                "port": port,
+                "service": service_name,
                 "type": "Forbidden",
                 "path": path,
                 "url": url,
                 "risk": "Low",
                 "confidence": 0.6
             })
+
+    # 2. Directory listing checks
     for path in WEB_LISTING_DIRS:
-        url = base + path
+        url = base_url + path
         status, content = http_get(url, timeout=6)
         if status == 200 and content and "Index of" in content:
             findings.append({
+                "port": port,
+                "service": service_name,
                 "type": "Directory Listing",
                 "path": path,
                 "url": url,
                 "risk": "Medium",
                 "confidence": 0.9
             })
-    if service_name in ["apache", "http"]:
-        for p in ["/server-status", "/server-info"]:
-            url = base + p
-            status, content = http_get(url, timeout=6)
-            if status == 200:
-                findings.append({
-                    "type": "Server Info Leak",
-                    "path": p,
-                    "url": url,
-                    "risk": "Medium",
-                    "confidence": 0.9
-                })
+
+    # 3. Crawl the site if requests available
+    if not requests:
+        safe_print("[-] 'requests' not available, skipping deep crawl.")
+        return findings
+
+    crawler = WebCrawler(base_url, max_pages=CRAWL_MAX_PAGES, delay=CRAWL_DELAY)
+    pages, forms = crawler.crawl()
+
+    # 4. Test each form for vulnerabilities
+    for form in forms:
+        url = form["action"]
+        method = form["method"]
+        inputs = form["inputs"]
+        # XSS test
+        xss_findings = test_xss_payload(crawler.session, url, method, inputs)
+        findings.extend(xss_findings)
+        # SQLi test
+        sqli_findings = test_sqli_error(crawler.session, url, method, inputs)
+        findings.extend(sqli_findings)
+        # Path traversal test
+        pt_findings = test_path_traversal(crawler.session, url, method, inputs)
+        findings.extend(pt_findings)
+
+    # 5. Additional checks: server version disclosure, etc.
+    # We could also try to fingerprint CMS, but that's complex. Leave for future.
+
+    safe_print(f"[*] Web assessment complete. Total findings: {len(findings)}")
     return findings
 
-def check_ftp_anonymous(ip: str, port: int) -> list:
-    findings = []
-    try:
-        import ftplib
-        ftp = ftplib.FTP()
-        ftp.connect(ip, port, timeout=SOCKET_TIMEOUT)
-        ftp.login("anonymous", "anonymous@")
-        files = ftp.nlst()
-        ftp.quit()
-        findings.append({
-            "type": "Anonymous FTP",
-            "details": f"Files/dirs: {', '.join(files[:5])}" if files else "No files visible",
-            "risk": "High",
-            "confidence": 0.95
-        })
-    except Exception:
-        pass
-    return findings
-
-# ----------------- Reporting -----------------
+# ----------------- Reporting (modified to include web findings) -----------------
 def generate_json_report(meta: dict, services: list, findings: list, out_file: str) -> None:
     report = {"meta": meta, "services": services, "findings": findings}
     with open(out_file, "w", encoding="utf-8") as f:
@@ -598,13 +804,17 @@ def generate_html_report(json_file: str, out_html: str) -> None:
             for c in svc["cves"]:
                 html.append(f"<li><b>{c['cve_id']}</b> {c.get('severity')} CVSS:{c.get('cvssv3')} Exploit:{int(c.get('exploitability',0)*100)}% Evidence:{', '.join(c.get('exploit_evidence',[])[:3])}</li>")
             html.append("</ul>")
+    if data.get("findings"):
+        html.append("<h2>Additional Findings</h2><ul>")
+        for f in data["findings"]:
+            html.append(f"<li><b>{f.get('type')}</b> on port {f.get('port')}: {f.get('url', f.get('details', ''))} (Risk: {f.get('risk')})</li>")
+        html.append("</ul>")
     html.append("</body></html>")
     with open(out_html, "w", encoding="utf-8") as f:
         f.write("\n".join(html))
     safe_print(f"[*] HTML report saved to {out_html}")
 
 def print_console_report(meta: dict, services: list, findings: list) -> None:
-    """Print a detailed report to the console with CVEs in a table."""
     print("\n" + "="*80)
     print(" VULNERABILITY SCAN REPORT")
     print("="*80)
@@ -626,7 +836,6 @@ def print_console_report(meta: dict, services: list, findings: list) -> None:
 
             if svc.get('cves'):
                 print("  CVEs (top 10 by exploitability):")
-                # Prepare table headers and rows
                 headers = ["CVE ID", "Severity", "CVSS", "Exploitability", "Evidence"]
                 rows = []
                 for c in svc['cves'][:10]:
@@ -639,27 +848,20 @@ def print_console_report(meta: dict, services: list, findings: list) -> None:
                         evidence = evidence[:27] + "..."
                     rows.append([cve_id, severity, cvss, exploit, evidence])
 
-                # Calculate column widths
                 col_widths = [max(len(str(row[i])) for row in rows + [headers]) for i in range(len(headers))]
-                # Ensure minimum widths
                 col_widths = [max(w, len(h)) for w, h in zip(col_widths, headers)]
 
-                # Print top border
                 print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
-                # Print header
                 header_line = "  |"
                 for i, h in enumerate(headers):
                     header_line += f" {h:<{col_widths[i]}} |"
                 print(header_line)
-                # Print separator
                 print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
-                # Print rows
                 for row in rows:
                     line = "  |"
                     for i, cell in enumerate(row):
                         line += f" {str(cell):<{col_widths[i]}} |"
                     print(line)
-                # Print bottom border
                 print("  +" + "+".join("-" * (w+2) for w in col_widths) + "+")
             else:
                 print("  No CVEs found for this service.")
@@ -669,17 +871,20 @@ def print_console_report(meta: dict, services: list, findings: list) -> None:
         print("ADDITIONAL FINDINGS")
         print("-"*80)
         for f in findings:
-            print(f"Port {f['port']}/{f['service']} - {f['type']} (Risk: {f.get('risk', 'Unknown')})")
+            port_info = f"Port {f['port']}/{f['service']} - " if 'port' in f else ""
+            print(f"{port_info}{f['type']} (Risk: {f.get('risk', 'Unknown')})")
             if f.get('url'):
                 print(f"  URL: {f['url']}")
             if f.get('details'):
                 print(f"  Details: {f['details']}")
+            if f.get('parameter'):
+                print(f"  Parameter(s): {', '.join(f['parameter'])}")
     else:
         print("\nNo additional findings.")
 
     print("="*80 + "\n")
 
-# ----------------- Scan Orchestration -----------------
+# ----------------- Scan Orchestration (modified to include web assessment) -----------------
 def scan_target(target: str, ports: list[int] | None = None, out_json: str | None = None, out_html: str | None = None) -> None:
     global _nvd_cache, _circl_cache, _kev_set, _exploitdb_set, _metasploit_set
     _nvd_cache = {}
@@ -711,7 +916,7 @@ def scan_target(target: str, ports: list[int] | None = None, out_json: str | Non
     safe_print(f"    KEV: {len(kev_set)} entries, Exploit-DB: {len(exploitdb_set)}, Metasploit: {len(metasploit_set)}")
 
     services_report = []
-    findings = []
+    findings = []  # global findings list
 
     for port, svc_tuple, banner in scan_results:
         name, ver, svc_conf, svc_reason = svc_tuple
@@ -730,14 +935,19 @@ def scan_target(target: str, ports: list[int] | None = None, out_json: str | Non
                 safe_print(f"            GitHub PoCs: {', '.join(c['github_pocs'][:2])}")
             svc_cves.append(c)
 
+        # Service-specific findings
         svc_findings = []
         if name in ("http", "https", "apache", "nginx") or port in (80, 443, 8080, 8443):
+            # Basic checks
             svc_findings.extend(check_web_interesting(ip, port, name))
+            # Deep web assessment
+            deep_findings = perform_web_assessment(ip, port, name)
+            svc_findings.extend(deep_findings)
         if name in ("ftp", "pure-ftpd", "vsftpd") or port == 21:
             svc_findings.extend(check_ftp_anonymous(ip, port))
 
         for f in svc_findings:
-            findings.append({"port": port, "service": name, **f})
+            findings.append(f)
 
         services_report.append({
             "port": port,
@@ -756,10 +966,8 @@ def scan_target(target: str, ports: list[int] | None = None, out_json: str | Non
         "os_confidence": os_conf
     }
 
-    # Print console report
     print_console_report(meta, services_report, findings)
 
-    # Generate files only if requested
     if out_json:
         generate_json_report(meta, services_report, findings, out_json)
     if out_html:
@@ -770,9 +978,87 @@ def scan_target(target: str, ports: list[int] | None = None, out_json: str | Non
 
     safe_print(f"[*] Scan complete. Open ports: {len(services_report)}")
 
-# ----------------- Menu -----------------
+# Existing helper functions (check_web_interesting, check_ftp_anonymous) remain unchanged
+def check_web_interesting(ip: str, port: int, service_name: str) -> list:
+    findings = []
+    protocol = "https" if port in (443, 8443) else "http"
+    base = f"{protocol}://{ip}:{port}"
+    for path in WEB_INTERESTING_PATHS:
+        url = base + path
+        status, content = http_get(url, timeout=6)
+        if status == 200:
+            findings.append({
+                "port": port,
+                "service": service_name,
+                "type": "Interesting File",
+                "path": path,
+                "url": url,
+                "risk": "Info" if path in ["/robots.txt", "/sitemap.xml"] else "Medium",
+                "confidence": 0.85
+            })
+        elif status == 403:
+            findings.append({
+                "port": port,
+                "service": service_name,
+                "type": "Forbidden",
+                "path": path,
+                "url": url,
+                "risk": "Low",
+                "confidence": 0.6
+            })
+    for path in WEB_LISTING_DIRS:
+        url = base + path
+        status, content = http_get(url, timeout=6)
+        if status == 200 and content and "Index of" in content:
+            findings.append({
+                "port": port,
+                "service": service_name,
+                "type": "Directory Listing",
+                "path": path,
+                "url": url,
+                "risk": "Medium",
+                "confidence": 0.9
+            })
+    if service_name in ["apache", "http"]:
+        for p in ["/server-status", "/server-info"]:
+            url = base + p
+            status, content = http_get(url, timeout=6)
+            if status == 200:
+                findings.append({
+                    "port": port,
+                    "service": service_name,
+                    "type": "Server Info Leak",
+                    "path": p,
+                    "url": url,
+                    "risk": "Medium",
+                    "confidence": 0.9
+                })
+    return findings
+
+def check_ftp_anonymous(ip: str, port: int) -> list:
+    findings = []
+    try:
+        import ftplib
+        ftp = ftplib.FTP()
+        ftp.connect(ip, port, timeout=SOCKET_TIMEOUT)
+        ftp.login("anonymous", "anonymous@")
+        files = ftp.nlst()
+        ftp.quit()
+        findings.append({
+            "port": port,
+            "service": "ftp",
+            "type": "Anonymous FTP",
+            "details": f"Files/dirs: {', '.join(files[:5])}" if files else "No files visible",
+            "risk": "High",
+            "confidence": 0.95
+        })
+    except Exception:
+        pass
+    return findings
+
+# ----------------- Menu (unchanged) -----------------
 def menu():
-    safe_print("Vulnerability Scanner v2 (Online CVE Lookup) - Menu")
+    safe_print("Vulnerability Scanner v3 (Online CVE Lookup + Web Crawler) - Menu")
     while True:
         safe_print("\n--- Menu ---")
         safe_print("1. Scan Target")
